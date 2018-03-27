@@ -38,6 +38,9 @@ import qualified Data.Text as T
 import GHC.Exts (fromList, toList)
 #if MIN_VERSION_base(4,9,0)
 import GHC.Stack
+#elif MIN_VERSION_base(4,8,1)
+import GHC.Stack ( CallStack(..) )
+import GHC.SrcLoc ( SrcLoc(..) )
 #else
 import Data.CallStack
 #endif
