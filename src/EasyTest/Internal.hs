@@ -38,9 +38,6 @@ import qualified Data.Text as T
 import GHC.Exts (fromList, toList)
 #if MIN_VERSION_base(4,9,0)
 import GHC.Stack
-#elif MIN_VERSION_base(4,8,1)
-import GHC.Stack ( CallStack(..) )
-import GHC.SrcLoc ( SrcLoc(..) )
 #else
 import Data.CallStack
 #endif
@@ -102,7 +99,7 @@ crash :: HasCallStack => Text -> Test a
 crash msg = do
   let trace = callStack
       trace' = fromList $ filter
-        (\(_msg, SrcLoc {srcLocFile}) -> srcLocFile /= "src/EasyTest/Porcelain.hs")
+        (\(_msg, loc) -> srcLocFile loc /= "src/EasyTest/Porcelain.hs")
         $ toList trace
       msg' = msg <> " " <> T.pack (prettyCallStack trace')
   Test (Just <$> putResult Failed)
