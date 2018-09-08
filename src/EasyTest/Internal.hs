@@ -29,6 +29,7 @@ import           Control.Exception
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
+import           Control.Monad.Trans.Maybe
 import           Data.List              (isPrefixOf)
 #if !(MIN_VERSION_base(4,11,0))
 import           Data.Semigroup
@@ -68,11 +69,11 @@ instance Monoid Status where
 
 data Env = Env
   { envRng      :: !(TVar Random.StdGen)
-  , envMessages :: ![Text]
+  , envScopes   :: ![Text]
+  , envAllow    :: ![Text]
   , envResults  :: !(TBQueue (Maybe (TMVar ([Text], Status))))
   , envNote     :: !(Text -> IO ())
   , envNoteDiff :: !([Diff String] -> IO ())
-  , envAllow    :: ![Text]
   }
 
 -- | Tests are values of type @Test a@, and 'Test' forms a monad with access to:
@@ -92,7 +93,7 @@ data Env = Env
 --     * conjunction of tests via 'MonadPlus' (the '<|>' operation runs both tests, even if the first test fails, and the tests function used above is just 'msum').
 --
 -- Using any or all of these capabilities, you assemble 'Test' values into a "test suite" (just another 'Test' value) using ordinary Haskell code, not framework magic. Notice that to generate a list of random values, we just 'replicateM' and 'forM' as usual.
-newtype Test a = Test (ReaderT Env IO (Maybe a))
+newtype Test a = Test (MaybeT (ReaderT Env IO) a)
 
 #if !MIN_VERSION_base(4,9,0)
 prettyCallStack :: CallStack -> String
@@ -107,9 +108,9 @@ crash msg = do
         (\(_msg, loc) -> srcLocFile loc /= "src/EasyTest/Porcelain.hs")
         $ toList trace
       msg' = msg <> " " <> T.pack (prettyCallStack trace')
-  Test (Just <$> putResult Failed)
+  putResult Failed
   noteScoped ("FAILURE " <> msg')
-  Test (pure Nothing)
+  empty
 
 -- | Record a failure with a diff at the current scope
 crashDiff :: HasCallStack => Text -> [Diff String] -> Test a
@@ -119,33 +120,33 @@ crashDiff msg chunks = do
         (\(_msg, loc) -> srcLocFile loc /= "src/EasyTest/Porcelain.hs")
         $ toList trace
       msg' = msg <> " " <> T.pack (prettyCallStack trace')
-  Test (Just <$> putResult Failed)
+  putResult Failed
   noteScoped ("FAILURE " <> msg')
   noteDiff chunks
-  Test (pure Nothing)
+  empty
 
-putResult :: Status -> ReaderT Env IO ()
+putResult :: (MonadReader Env m, MonadIO m) => Status -> m ()
 putResult passed = do
-  msgs <- asks envMessages
-  allow <- asks envAllow
+  scopes <- asks envScopes
+  allow  <- asks envAllow
   r <- liftIO . atomically $ newTMVar
-    (msgs, if allow `isPrefixOf` msgs then passed else Skipped)
+    (scopes, if allow `isPrefixOf` scopes then passed else Skipped)
   q <- asks envResults
-  lift . atomically $ writeTBQueue q (Just r)
+  liftIO . atomically $ writeTBQueue q (Just r)
 
 -- | Label a test. Can be nested. A "." is placed between nested
 -- scopes, so @scope "foo" . scope "bar"@ is equivalent to @scope "foo.bar"@
 scope :: Text -> Test a -> Test a
-scope msg (Test t) = Test $ do
+scope msg t = do
   env <- ask
-  let msg' = T.splitOn "." msg
-      messages' = envMessages env <> msg'
-      env' = env { envMessages = messages' }
-      passes = actionAllowed env'
+  let msg'      = T.splitOn "." msg
+      scopes'   = envScopes env <> msg'
+      env'      = env { envScopes = scopes' }
+      passes    = actionAllowed env'
 
   if passes
-    then liftIO $ runReaderT t env'
-    else putResult Skipped >> pure Nothing
+    then local (const env') t
+    else putResult Skipped >> empty
 
 -- | Prepend the current scope to a logging message
 noteScoped :: Text -> Test ()
@@ -169,55 +170,55 @@ note msg = do
 
 -- | The current scope
 currentScope :: Test [Text]
-currentScope = asks envMessages
+currentScope = asks envScopes
 
 -- | Catch all exceptions that could occur in the given `Test`
 wrap :: Test a -> Test a
-wrap (Test t) = Test $ do
+wrap (Test t) = Test $ MaybeT $ do
   env <- ask
   lift $ runWrap env t
 
-runWrap :: Env -> ReaderT Env IO (Maybe a) -> IO (Maybe a)
+runWrap :: Env -> MaybeT (ReaderT Env IO) a -> IO (Maybe a)
 runWrap env t = do
-  result <- try $ runReaderT t env
+  result <- try $ runReaderT (runMaybeT t) env
   case result of
     Left e -> do
       envNote env $
-           T.intercalate "." (envMessages env)
+           T.intercalate "." (envScopes env)
         <> " EXCEPTION: "
         <> T.pack (show (e :: SomeException))
       runReaderT (putResult Failed) env
       pure Nothing
     Right a -> pure a
 
--- * @allow' `isPrefixOf` messages'@: we're messaging within the allowed range
--- * @messages' `isPrefixOf` allow'@: we're still building a prefix of the
+-- * @allow' `isPrefixOf` scopes'@: we're messaging within the allowed range
+-- * @scopes' `isPrefixOf` allow'@: we're still building a prefix of the
 --   allowed range but could go deeper
 actionAllowed :: Env -> Bool
-actionAllowed Env{envMessages = messages, envAllow = allow}
-  = allow `isPrefixOf` messages || messages `isPrefixOf` allow
+actionAllowed Env{envScopes = scopes, envAllow = allow}
+  = allow `isPrefixOf` scopes || scopes `isPrefixOf` allow
 
 instance MonadReader Env Test where
-  ask = Test $ do
+  ask = Test $ MaybeT $ do
     allowed <- asks actionAllowed
     if allowed
       then Just <$> ask
-      else pure Nothing
-  local f (Test t) = Test (local f t)
-  reader f = Test (Just <$> reader f)
+      else empty
+  local f (Test t) = Test $ local f t
+  reader f = Test $ reader f
 
 instance Monad Test where
   fail = crash . T.pack
-  return a = Test $ do
+  return a = Test $ MaybeT $ do
     allowed <- asks actionAllowed
     pure $ if allowed
       then Just a
       else Nothing
-  Test a >>= f = Test $ do
-    a' <- a
+  Test a >>= f = Test $ MaybeT $ do
+    a' <- runMaybeT a
     case a' of
       Nothing  -> pure Nothing
-      Just a'' -> let Test t = f a'' in t
+      Just a'' -> let Test (MaybeT t) = f a'' in t
 
 instance Functor Test where
   fmap = liftM
@@ -230,12 +231,12 @@ instance MonadIO Test where
   liftIO action = do
     allowed <- asks actionAllowed
     if allowed
-      then wrap $ Test (Just <$> liftIO action)
-      else Test (pure Nothing)
+      then wrap $ liftIO action
+      else empty
 
 instance Alternative Test where
-  empty = Test (pure Nothing)
-  Test t1 <|> Test t2 = Test $ do
+  empty = Test $ MaybeT $ pure Nothing
+  Test t1 <|> Test t2 = Test $ MaybeT $ do
     env <- ask
     (rng1, rng2) <- liftIO . atomically $ do
       currentRng <- readTVar (envRng env)

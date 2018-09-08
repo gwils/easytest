@@ -39,6 +39,7 @@ import           Control.Exception
 import           Control.Monad
 import           Control.Monad.IO.Class
 import           Control.Monad.Reader
+import           Control.Monad.Trans.Maybe
 #if !(MIN_VERSION_base(4,11,0))
 import           Data.Semigroup
 #endif
@@ -136,7 +137,7 @@ atomicLogger = do
 
 -- | A test with a setup and teardown
 using :: IO r -> (r -> IO ()) -> (r -> Test a) -> Test a
-using r cleanup use = Test $ do
+using r cleanup use = Test $ MaybeT $ do
   r' <- liftIO r
   env <- ask
   let Test t = use r'
@@ -188,7 +189,7 @@ run' seed note_ noteDiff_ allowed (Test t) = do
   let line = "------------------------------------------------------------"
   note_ "Raw test output to follow ... "
   note_ line
-  result <- try (runReaderT (void t) (Env rngVar [] resultsQ note_ noteDiff_ allowed))
+  result <- try (runReaderT (void (runMaybeT t)) (Env rngVar [] allowed resultsQ note_ noteDiff_))
     :: IO (Either SomeException ())
   case result of
     Left e   -> note_ $ "Exception while running tests: " <> show' e
@@ -242,11 +243,11 @@ note' = note . show'
 
 -- | Record a successful test at the current scope
 ok :: Test ()
-ok = Test (Just <$> putResult (Passed 1))
+ok = putResult (Passed 1)
 
 -- | Explicitly skip this test
 skip :: Test ()
-skip = Test (Nothing <$ putResult Skipped)
+skip = putResult Skipped
 
 -- | Run a test in a separate thread, not blocking for its result.
 fork :: Test a -> Test ()
@@ -262,7 +263,7 @@ fork' (Test t) = do
   r <- liftIO . A.async $ runWrap env t
   waiter <- liftIO . A.async $ do
     e <- A.waitCatch r
-    _ <- atomically $ tryPutTMVar tmvar (envMessages env, Skipped)
+    _ <- atomically $ tryPutTMVar tmvar (envScopes env, Skipped)
     case e of
       Left _  -> pure Nothing
       Right a -> pure a
